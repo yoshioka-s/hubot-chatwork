@@ -11,6 +11,12 @@ class Chatwork extends Adapter
     for string in strings
       @bot.Room(envelope.room).Messages().create string, (err, data) =>
         @robot.logger.error "Chatwork send error: #{err}" if err?
+        if err instanceof ChatWorkLimitOver
+          # resend later
+          interval = Math.min err.rateLimitReset*1000 - new Date, 0
+          setTimeout ()=>
+            @send envelope, strings
+          , interval
 
   # override
   reply: (envelope, strings...) ->
@@ -43,6 +49,12 @@ class Chatwork extends Adapter
 exports.use = (robot) ->
   new Chatwork robot
 
+class ChatWorkLimitOver extends Error
+  constructor: (rateLimitReset) ->
+    @rateLimitReset = rateLimitReset
+  toString: ->
+    "Chatwork API Limit Error: rate reset at #{ Date @rateLimitReset }"
+
 class ChatworkStreaming extends EventEmitter
   constructor: (options, @robot) ->
     unless options.token? and options.rooms? and options.apiRate?
@@ -54,6 +66,8 @@ class ChatworkStreaming extends EventEmitter
     @rooms = options.rooms.split ','
     @host = 'api.chatwork.com'
     @rate = parseInt options.apiRate, 10
+    @isLimitOver = false
+    @interval = 0
 
     unless @rate > 0
       @robot.logger.error 'API rate must be greater then 0'
@@ -136,15 +150,31 @@ class ChatworkStreaming extends EventEmitter
       listen: =>
         timeout = =>
           @Room(id).Messages().show (err, messages) =>
-            for message in messages
-              @emit 'message',
-                id,
-                message.message_id,
-                message.account,
-                message.body,
-                message.send_time,
-                message.update_time
-            setTimeout timeout, 1000 / (@rate / (60 * 60))
+            if err instanceof ChatWorkLimitOver
+              unless @isLimitOver
+                # don't change interval after the first limit over response so that requests are resent in order
+                @interval = Math.min err.rateLimitReset*1000 - new Date  0
+                @robot.logger.info "Rate Limit Over:  Wait #{@interval} ms"
+                @isLimitOver = true
+
+                # reset after interval
+                rateReset = =>
+                  @interval = 0
+                  @isLimitOver = false
+                setTimeout rateReset, @interval
+
+              setTimeout timeout, @interval
+
+            else
+              for message in messages
+                @emit 'message',
+                  id,
+                  message.message_id,
+                  message.account,
+                  message.body,
+                  message.send_time,
+                  message.update_time
+              setTimeout timeout, 1000 / (@rate / (60 * 60))
         timeout()
 
     Message: (mid) =>
@@ -197,6 +227,11 @@ class ChatworkStreaming extends EventEmitter
     @request "DELETE", path, body, callback
 
   request: (method, path, body, callback) ->
+    if @isLimitOver
+      if callback
+        callback new ChatWorkLimitOver
+      return
+
     logger = @robot.logger
 
     headers =
@@ -225,7 +260,10 @@ class ChatworkStreaming extends EventEmitter
         if response.statusCode >= 400
           switch response.statusCode
             when 401
-              throw new Error "Invalid access token provided"
+              throw new "Invalid access token provided"
+            when 429  # Exceeded API limit
+              return callback new ChatWorkLimitOver(response.headers['x-ratelimit-reset'])
+
             else
               logger.error "Chatwork HTTPS status code: #{response.statusCode}"
               logger.error "Chatwork HTTPS response data: #{data}"
