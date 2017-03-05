@@ -11,12 +11,6 @@ class Chatwork extends Adapter
     for string in strings
       @bot.Room(envelope.room).Messages().create string, (err, data) =>
         @robot.logger.error "Chatwork send error: #{err}" if err?
-        if err instanceof ChatWorkLimitOver
-          # resend later
-          interval = Math.min err.rateLimitReset*1000 - new Date, 0
-          setTimeout ()=>
-            @send envelope, strings
-          , interval
 
   # override
   reply: (envelope, strings...) ->
@@ -34,6 +28,7 @@ class Chatwork extends Adapter
 
     for roomId in bot.rooms
       bot.Room(roomId).Messages().listen()
+    bot.Rooms().listen()
 
     bot.on 'message', (roomId, id, account, body, sendAt, updatedAt) =>
       user = @robot.brain.userForId account.account_id,
@@ -45,6 +40,9 @@ class Chatwork extends Adapter
     @bot = bot
 
     @emit 'connected'
+
+  room: (roomId) ->
+    @bot.Room(roomId)
 
 exports.use = (robot) ->
   new Chatwork robot
@@ -68,7 +66,9 @@ class ChatworkStreaming extends EventEmitter
     @rate = parseInt options.apiRate, 10
     @isLimitOver = false
     @interval = 0
+    @requestQue = []
 
+    @robot.logger.info "API rate: #{@rate}"
     unless @rate > 0
       @robot.logger.error 'API rate must be greater then 0'
       process.exit 1
@@ -104,6 +104,30 @@ class ChatworkStreaming extends EventEmitter
       params.push "members_readonly_ids=#{opts.roIds.join ','}" if opts.roIds?
       body = params.join '&'
       @post "/rooms", body, callback
+
+    listen: (callback) =>
+      timeout = =>
+        @Rooms().show((err, rooms) =>
+          if !err
+            @rooms = @rooms.filter((listeningRoomId) ->
+              rooms.some((room) ->
+                listeningRoomId == room.room_id.toString()
+              )
+            )
+            newRooms = rooms.filter((room) =>
+              @rooms.indexOf(room.room_id.toString()) == -1
+            )
+            newRooms.forEach((room) =>
+              roomId = room.room_id.toString()
+              @rooms.push roomId
+              @Room(roomId).Messages().listen()
+            )
+            setTimeout(timeout, 1000 / (@rate / (60 * 60)));
+
+          if callback
+            callback(err, rooms)
+        )
+      timeout()
 
   Room: (id) =>
     baseUrl = "/rooms/#{id}"
@@ -149,23 +173,11 @@ class ChatworkStreaming extends EventEmitter
 
       listen: =>
         timeout = =>
+          if @rooms.indexOf(id) == -1
+            return
+
           @Room(id).Messages().show (err, messages) =>
-            if err instanceof ChatWorkLimitOver
-              unless @isLimitOver
-                # don't change interval after the first limit over response so that requests are resent in order
-                @interval = Math.min err.rateLimitReset*1000 - new Date  0
-                @robot.logger.info "Rate Limit Over:  Wait #{@interval} ms"
-                @isLimitOver = true
-
-                # reset after interval
-                rateReset = =>
-                  @interval = 0
-                  @isLimitOver = false
-                setTimeout rateReset, @interval
-
-              setTimeout timeout, @interval
-
-            else
+            if messages
               for message in messages
                 @emit 'message',
                   id,
@@ -174,7 +186,9 @@ class ChatworkStreaming extends EventEmitter
                   message.body,
                   message.send_time,
                   message.update_time
-              setTimeout timeout, 1000 / (@rate / (60 * 60))
+
+            setTimeout timeout, 1000 / (@rate / (60 * 60))
+
         timeout()
 
     Message: (mid) =>
@@ -250,22 +264,42 @@ class ChatworkStreaming extends EventEmitter
     body = new Buffer body
     options.headers["Content-Length"] = body.length
 
-    request = HTTPS.request options, (response) ->
+    request = HTTPS.request options, (response) =>
       data = ""
 
       response.on "data", (chunk) ->
         data += chunk
 
-      response.on "end", ->
+      response.on "end", =>
         if response.statusCode >= 400
           switch response.statusCode
             when 401
               throw new "Invalid access token provided"
             when 429  # Exceeded API limit
-              return callback new ChatWorkLimitOver(response.headers['x-ratelimit-reset'])
+              unless @isLimitOver
+                # don't change interval after the first limit over response so that requests are resent in order
+                @interval = response.headers['x-ratelimit-reset']*1000 - new Date
+                @robot.logger.info "Rate Limit Over: Wait #{@interval / 1000} seconds"
+                if @interval > 0
+                  @isLimitOver = true
+
+                  # reset after the interval
+                  rateReset = =>
+                    @interval = 0
+                    @isLimitOver = false
+                  setTimeout rateReset, @interval
+
+                else
+                  @interval = 0
+
+              setTimeout () =>
+                @request(method, path, body, callback)
+              , @interval
+              return
 
             else
               logger.error "Chatwork HTTPS status code: #{response.statusCode}"
+              logger.error "#{method} #{path}"
               logger.error "Chatwork HTTPS response data: #{data}"
 
         if callback
@@ -273,11 +307,10 @@ class ChatworkStreaming extends EventEmitter
           callback null, json
 
       response.on "error", (err) ->
-        logger.error "Chatwork HTTPS response error: #{err}"
+        logger.error "Chatwork HTTPS response error: #{method} #{path} #{err}"
         callback err, {}
 
     request.end body, 'binary'
 
     request.on "error", (err) ->
-      logger.error "Chatwork request error: #{err}"
-
+      logger.error "Chatwork request error: #{err}, (#{method} #{path})"
